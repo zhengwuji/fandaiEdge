@@ -16,6 +16,42 @@
 // All config data is stored in Cookies or URL parameters.
 // ===============================================================
 
+// Base64 encoding helper (compatible with Cloudflare Workers)
+function base64Encode(str) {
+  try {
+    // Cloudflare Workers support btoa, but need to handle UTF-8 properly
+    if (typeof btoa === "function") {
+      // Convert UTF-8 string to binary string for btoa
+      const utf8Bytes = new TextEncoder().encode(str);
+      let binary = '';
+      for (let i = 0; i < utf8Bytes.length; i++) {
+        binary += String.fromCharCode(utf8Bytes[i]);
+      }
+      return btoa(binary);
+    }
+    // Fallback: manual base64 encoding
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const utf8Bytes = new TextEncoder().encode(str);
+    let result = '';
+    let i = 0;
+    while (i < utf8Bytes.length) {
+      const a = utf8Bytes[i++];
+      const b = i < utf8Bytes.length ? utf8Bytes[i++] : 0;
+      const c = i < utf8Bytes.length ? utf8Bytes[i++] : 0;
+      const bitmap = (a << 16) | (b << 8) | c;
+      result += chars.charAt((bitmap >> 18) & 63);
+      result += chars.charAt((bitmap >> 12) & 63);
+      result += i - 2 < utf8Bytes.length ? chars.charAt((bitmap >> 6) & 63) : '=';
+      result += i - 1 < utf8Bytes.length ? chars.charAt(bitmap & 63) : '=';
+    }
+    return result;
+  } catch (e) {
+    // Ultimate fallback: return empty string
+    console.error("Base64 encoding error:", e);
+    return '';
+  }
+}
+
 // Simple hash function for password verification (using Web Crypto API)
 async function hashPassword(password) {
   const encoder = new TextEncoder();
@@ -186,6 +222,77 @@ export default {
       return new Response("RESET_OK", { headers });
     }
 
+    // --- Health Check API (健康检查) ---
+    if (pathname === "/health" || pathname === "/api/health") {
+      const cfg = await loadConfig(request, url, sessionSecret);
+      const health = {
+        status: "ok",
+        timestamp: new Date().toISOString(),
+        worker: {
+          name: "VLESS Edge Worker",
+          version: "1.0.0",
+          uptime: "running"
+        },
+        config: {
+          hasUuid: !!cfg?.uuid,
+          hasWorkerHost: !!cfg?.workerHost,
+          hasBackendHost: !!cfg?.backendHost,
+          hasBackendPort: !!cfg?.backendPort,
+          wsPath: cfg?.wsPath || "/echws",
+          mode: cfg?.mode || "A",
+          configured: !!(cfg?.uuid && cfg?.workerHost && cfg?.backendHost && cfg?.backendPort)
+        },
+        network: {
+          ip: request.headers.get("CF-Connecting-IP") || "",
+          country: request.cf && request.cf.country || "",
+          region: request.cf && request.cf.region || "",
+          city: request.cf && request.cf.city || "",
+          colo: request.cf && request.cf.colo || "",
+          asn: request.cf && request.cf.asn || ""
+        },
+        endpoints: {
+          subscription: "/sub",
+          admin: "/",
+          geo: "/api/geo",
+          singbox: "/singbox",
+          clash: "/clash",
+          qrcode: "/qrcode",
+          websocket: "/echws"
+        }
+      };
+
+      // 评估整体健康状态
+      if (!health.config.configured) {
+        health.status = "warning";
+        health.message = "配置不完整，请访问管理面板完成配置";
+      } else {
+        health.status = "ok";
+        health.message = "Worker 运行正常，配置完整";
+      }
+
+      // 检查是否请求 JSON 格式（通过 Accept 头或 ?format=json 参数）
+      const acceptHeader = request.headers.get("Accept") || "";
+      const formatParam = url.searchParams.get("format");
+      const wantsJson = formatParam === "json" || acceptHeader.includes("application/json");
+
+      if (wantsJson) {
+        return new Response(JSON.stringify(health, null, 2), {
+          headers: { 
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-cache, no-store, must-revalidate"
+          }
+        });
+      }
+
+      // 返回 HTML UI
+      return new Response(renderHealthPage(health), {
+        headers: { 
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-cache, no-store, must-revalidate"
+        }
+      });
+    }
+
     // --- Geo info API (线路探测 + 节点评分 + 优选建议) ---
     if (pathname === "/api/geo") {
       const info = {
@@ -264,7 +371,35 @@ export default {
 
     // --- Public API: subscriptions (not protected,方便客户端直接订阅) ---
     if (pathname === "/sub") {
+      try {
       const cfg = await loadConfig(request, url, sessionSecret);
+
+        // 验证配置是否完整
+        if (!cfg || !cfg.uuid || !cfg.workerHost || !cfg.backendHost || !cfg.backendPort) {
+          // 配置不完整，记录详细日志
+          const missingFields = [];
+          if (!cfg?.uuid) missingFields.push("UUID");
+          if (!cfg?.workerHost) missingFields.push("Worker域名");
+          if (!cfg?.backendHost) missingFields.push("后端域名");
+          if (!cfg?.backendPort) missingFields.push("后端端口");
+          
+          console.error("Config incomplete. Missing fields:", missingFields.join(", "));
+          console.error("Config state:", {
+            hasUuid: !!cfg?.uuid,
+            hasWorkerHost: !!cfg?.workerHost,
+            hasBackendHost: !!cfg?.backendHost,
+            hasBackendPort: !!cfg?.backendPort,
+            cookieHeader: request.headers.get("Cookie") ? "present" : "missing"
+          });
+          
+          // 返回空字符串（v2rayN 会显示为空订阅）
+          return new Response("", {
+            headers: { 
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-cache, no-store, must-revalidate"
+            }
+          });
+        }
 
       // 订阅 IP 模式：
       // ?ip=domain  → 只用域名（默认）
@@ -286,12 +421,56 @@ export default {
       }
 
       const str = generateV2raySub(cfg, ipOption);
-      const b64 = typeof btoa === "function"
-        ? btoa(str)
-        : Buffer.from(str, "utf-8").toString("base64");
+        
+        // 如果生成的订阅为空，记录日志并返回空字符串
+        if (!str || str.trim().length === 0) {
+          console.error("Generated subscription is empty. Config:", {
+            uuid: cfg.uuid ? "***" : "missing",
+            workerHost: cfg.workerHost || "missing",
+            backendHost: cfg.backendHost || "missing",
+            backendPort: cfg.backendPort || "missing",
+            wsPath: cfg.wsPath || "missing",
+            mode: ipOption.mode,
+            ipCount: ipList.length
+          });
+          return new Response("", {
+            headers: { 
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-cache, no-store, must-revalidate"
+            }
+          });
+        }
+        
+        // 使用安全的 base64 编码函数
+        const b64 = base64Encode(str);
+        
+        // 确保 Base64 编码结果不为空
+        if (!b64 || b64.length === 0) {
+          console.error("Base64 encoding failed, original string length:", str.length);
+          return new Response("", {
+            headers: { 
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-cache, no-store, must-revalidate"
+            }
+          });
+        }
+        
       return new Response(b64, {
-        headers: { "content-type": "text/plain; charset=utf-8" }
+          headers: { 
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-cache, no-store, must-revalidate"
+          }
+        });
+      } catch (error) {
+        // 捕获所有错误，避免 500 错误
+        console.error("Subscription generation error:", error);
+        return new Response("", {
+          headers: { 
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-cache, no-store, must-revalidate"
+          }
       });
+      }
     }
 
     if (pathname === "/singbox") {
@@ -321,7 +500,79 @@ export default {
     // --- WebSocket for VLESS proxy (no auth, for clients) ---
     const upgrade = request.headers.get("Upgrade") || "";
     if (upgrade.toLowerCase() === "websocket") {
-      const cfg = await loadConfig(request, url, sessionSecret);
+      // 首先尝试从 URL 查询参数读取配置
+      let cfg = await loadConfig(request, url, sessionSecret);
+      
+      // 如果配置不完整，尝试从路径中提取配置
+      // 路径格式可能是：/echws/{base64_config} 或 /echws/{base64_config}/...
+      if (!cfg || !cfg.backendHost || !cfg.backendPort) {
+        const pathParts = url.pathname.split('/').filter(p => p);
+        // 查找 /echws 后面的配置部分
+        const echwsIndex = pathParts.indexOf('echws');
+        if (echwsIndex >= 0 && pathParts.length > echwsIndex + 1) {
+          const configB64 = pathParts[echwsIndex + 1];
+          try {
+            // 还原 Base64 编码（处理 URL 安全的 Base64）
+            const normalizedB64 = configB64.replace(/-/g, '+').replace(/_/g, '/');
+            // 添加填充
+            const paddedB64 = normalizedB64 + '='.repeat((4 - normalizedB64.length % 4) % 4);
+            // Base64 解码
+            const binaryString = atob(paddedB64);
+            const configJson = binaryString;
+            const wsConfig = JSON.parse(configJson);
+            // 合并配置
+            cfg = {
+              ...cfg,
+              backendHost: wsConfig.h || wsConfig.backendHost || cfg?.backendHost,
+              backendPort: wsConfig.p || wsConfig.backendPort || cfg?.backendPort,
+              wsPath: cfg?.wsPath || "/echws",
+              mode: wsConfig.m || wsConfig.mode || cfg?.mode || "A"
+            };
+            console.log("Config loaded from WebSocket path:", {
+              backendHost: cfg.backendHost,
+              backendPort: cfg.backendPort
+            });
+          } catch (e) {
+            console.error("Failed to parse config from WebSocket path:", e, "path:", url.pathname);
+          }
+        }
+        
+        // 如果还是不行，尝试从查询参数读取
+        if ((!cfg || !cfg.backendHost || !cfg.backendPort) && url.search) {
+          const cfgMatch = url.search.match(/[?&]cfg=([^&]+)/);
+          if (cfgMatch) {
+            try {
+              const decoded = decodeURIComponent(cfgMatch[1]);
+              const wsConfig = JSON.parse(decoded);
+              cfg = {
+                ...cfg,
+                backendHost: wsConfig.backendHost || wsConfig.h || cfg?.backendHost,
+                backendPort: wsConfig.backendPort || wsConfig.p || cfg?.backendPort,
+                wsPath: wsConfig.wsPath || cfg?.wsPath || "/echws",
+                mode: wsConfig.mode || wsConfig.m || cfg?.mode || "A"
+              };
+              console.log("Config loaded from WebSocket query parameter");
+            } catch (e) {
+              console.error("Failed to parse config from query parameter:", e);
+            }
+          }
+        }
+      }
+      
+      // 验证配置是否完整
+      if (!cfg || !cfg.backendHost || !cfg.backendPort) {
+        console.error("WebSocket: Config incomplete", {
+          hasUuid: !!cfg?.uuid,
+          hasWorkerHost: !!cfg?.workerHost,
+          hasBackendHost: !!cfg?.backendHost,
+          hasBackendPort: !!cfg?.backendPort,
+          urlPath: url.pathname,
+          urlSearch: url.search,
+          fullPath: url.pathname + url.search
+        });
+        return new Response("Configuration incomplete", { status: 502 });
+      }
+      
       return handleWS(request, cfg);
     }
 
@@ -516,8 +767,13 @@ function renderAdminUI() {
   </style>
 </head>
 <body class="p-6">
+  <div class="flex items-center justify-between mb-2">
+    <div>
   <h1 class="text-3xl font-bold mb-2">🚀 VLESS Edge 节点管理系统</h1>
-  <p class="text-gray-600 mb-6">通过本面板，你可以可视化配置 Cloudflare Worker 反代的 VLESS 节点，并一键生成 v2rayN / SingBox / Clash 订阅。</p>
+      <p class="text-gray-600">通过本面板，你可以可视化配置 Cloudflare Worker 反代的 VLESS 节点，并一键生成 v2rayN / SingBox / Clash 订阅。</p>
+    </div>
+    <a href="/health" target="_blank" class="px-4 py-2 rounded-lg font-semibold text-white whitespace-nowrap ml-4" style="background: #10b981; text-decoration: none; height: fit-content;">🔍 健康检查</a>
+  </div>
 
   <!-- 线路检测 / Geo 信息 -->
   <div class="card mb-6">
@@ -611,16 +867,23 @@ function renderAdminUI() {
   <!-- 订阅区 -->
   <div class="card mb-6">
     <h2 class="text-xl font-semibold mb-4">订阅 & 导入</h2>
-    <div class="space-y-2 text-sm">
-      <p>v2rayN 订阅（Base64）：</p>
-      <p><code id="subUrl"></code></p>
-      <p class="text-xs text-slate-500">复制上述链接到 v2rayN → 订阅 → 添加订阅，即可自动导入节点。</p>
+    <div class="space-y-3">
+      <div>
+        <p class="text-sm font-semibold mb-2">v2rayN 订阅链接（推荐）：</p>
+        <div class="flex items-center gap-2">
+          <input type="text" id="subUrlWithConfig" class="input flex-1" readonly placeholder="配置完成后点击下方按钮生成订阅链接">
+          <button id="generateSubUrl" class="btn">生成订阅链接</button>
+        </div>
+        <p class="text-xs text-slate-500 mt-1">⚠️ 重要：由于 v2rayN 不会携带浏览器 Cookie，请使用此链接（包含配置参数）添加到 v2rayN。</p>
+      </div>
+      <div>
+        <p class="text-sm font-semibold mb-2">基础订阅链接（需要 Cookie）：</p>
+        <p><code id="subUrl" class="text-xs break-all"></code></p>
+        <p class="text-xs text-slate-500">此链接仅在浏览器中有效（需要 Cookie），v2rayN 无法使用。</p>
+      </div>
     </div>
     <div class="mt-3 space-x-2">
-      <a href="/sub" target="_blank" class="btn2">打开 v2rayN 订阅内容</a>
-      <a href="/singbox" target="_blank" class="btn2">查看 SingBox JSON</a>
-      <a href="/clash" target="_blank" class="btn2">查看 Clash Meta YAML</a>
-      <a href="/qrcode" target="_blank" class="btn2">查看节点二维码</a>
+      <a href="/health" target="_blank" class="btn2" style="background: #10b981; color: white;">🔍 健康检查</a>
     </div>
   </div>
 
@@ -656,6 +919,10 @@ function renderAdminUI() {
         var loc = window.location;
         var base = loc.origin;
         document.getElementById("subUrl").textContent = base + "/sub";
+        // 如果配置完整，自动生成订阅链接
+        if (cfg.uuid && cfg.workerHost && cfg.backendHost && cfg.backendPort) {
+          generateSubscriptionUrl();
+        }
       } catch(e) {}
 
       // 额外：加载 Geo 信息
@@ -754,6 +1021,72 @@ function renderAdminUI() {
       setTimeout(function(){ m.textContent = ""; }, 3000);
     }
 
+    // 生成订阅链接函数
+    function generateSubscriptionUrl() {
+      var uuidEl = document.getElementById("uuid");
+      var workerHostEl = document.getElementById("workerHost");
+      var backendHostEl = document.getElementById("backendHost");
+      var backendPortEl = document.getElementById("backendPort");
+      var wsPathEl = document.getElementById("wsPath");
+      var fakeHostEl = document.getElementById("fakeHost");
+      var sniEl = document.getElementById("sni");
+      var uaEl = document.getElementById("ua");
+      var modeInput = document.querySelector("input[name='wsMode']:checked");
+      var mode = modeInput ? modeInput.value : "A";
+
+      // 验证必填字段
+      if (!uuidEl.value || !workerHostEl.value || !backendHostEl.value || !backendPortEl.value) {
+        document.getElementById("subUrlWithConfig").value = "请先填写必填字段（UUID、Worker域名、后端域名、后端端口）";
+        return;
+      }
+
+      // 收集节点列表
+      var nodesDivs = document.querySelectorAll("#nodes > div");
+      var nodesData = [];
+      nodesDivs.forEach(function(d){
+        var host = d.querySelector(".node-host")?.value;
+        if (host) {
+          nodesData.push({
+            host: host,
+            name: d.querySelector(".node-name")?.value || host
+          });
+        }
+      });
+
+      // 构建配置对象
+      var cfg = {
+        uuid: uuidEl.value.trim(),
+        workerHost: workerHostEl.value.trim(),
+        wsPath: wsPathEl.value.trim() || "/echws",
+        backendHost: backendHostEl.value.trim(),
+        backendPort: backendPortEl.value.trim(),
+        fakeHost: fakeHostEl.value.trim(),
+        sni: sniEl.value.trim(),
+        ua: uaEl.value.trim(),
+        mode: mode,
+        nodes: nodesData
+      };
+
+      // 将配置编码为 JSON 并 URL 编码
+      try {
+        var cfgJson = JSON.stringify(cfg);
+        var cfgEncoded = encodeURIComponent(cfgJson);
+        var base = window.location.origin;
+        var subUrl = base + "/sub?cfg=" + cfgEncoded;
+        document.getElementById("subUrlWithConfig").value = subUrl;
+      } catch(e) {
+        document.getElementById("subUrlWithConfig").value = "生成订阅链接失败：" + e.message;
+      }
+    }
+
+    // 绑定生成订阅链接按钮
+    var generateBtn = document.getElementById("generateSubUrl");
+    if (generateBtn) {
+      generateBtn.onclick = function() {
+        generateSubscriptionUrl();
+      };
+    }
+
     loadConfig();
   <\/script>
 </body>
@@ -765,13 +1098,21 @@ function renderAdminUI() {
 // ===============================================================
 async function loadConfig(request, url, sessionSecret) {
   // First try to get from Cookie
-  const cookies = parseCookies(request.headers.get("Cookie") || "");
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const cookies = parseCookies(cookieHeader);
   let raw = null;
   
   if (cookies["vless_config"]) {
     try {
       raw = await decrypt(cookies["vless_config"], sessionSecret);
-    } catch (e) {}
+      if (raw) {
+        console.log("Config loaded from cookie, length:", raw.length);
+      }
+    } catch (e) {
+      console.error("Failed to decrypt config cookie:", e);
+    }
+  } else {
+    console.log("No vless_config cookie found. Available cookies:", Object.keys(cookies));
   }
   
   // If not in cookie, try URL parameter
@@ -780,11 +1121,15 @@ async function loadConfig(request, url, sessionSecret) {
     if (cfgParam) {
       try {
         raw = decodeURIComponent(cfgParam);
-      } catch (e) {}
+        console.log("Config loaded from URL parameter, length:", raw.length);
+      } catch (e) {
+        console.error("Failed to decode config from URL parameter:", e);
+      }
     }
   }
   
   if (!raw) {
+    console.log("No config found, returning default empty config");
     return {
       uuid: "",
       workerHost: "",
@@ -800,8 +1145,16 @@ async function loadConfig(request, url, sessionSecret) {
   }
   
   try {
-    return JSON.parse(raw);
+    const config = JSON.parse(raw);
+    console.log("Config parsed successfully:", {
+      hasUuid: !!config.uuid,
+      hasWorkerHost: !!config.workerHost,
+      hasBackendHost: !!config.backendHost,
+      hasBackendPort: !!config.backendPort
+    });
+    return config;
   } catch (e) {
+    console.error("Failed to parse config JSON:", e);
     return {
       uuid: "",
       workerHost: "",
@@ -821,16 +1174,75 @@ async function loadConfig(request, url, sessionSecret) {
 // VLESS URL builder
 // ===============================================================
 function buildVlessUrl(cfg, hostOverride = null, name = "Node") {
+  try {
+    // 验证必要参数
+    if (!cfg || typeof cfg !== "object") {
+      return null;
+    }
+    
+    if (!cfg.uuid || typeof cfg.uuid !== "string" || cfg.uuid.trim().length === 0) {
+      return null;
+    }
+    
+    if (!cfg.workerHost || typeof cfg.workerHost !== "string" || cfg.workerHost.trim().length === 0) {
+      return null;
+    }
+    
   const host = hostOverride || cfg.workerHost;
-  const params = new URLSearchParams({
-    encryption: "none",
-    security: "tls",
-    type: "ws",
-    path: cfg.wsPath,
-    host: cfg.fakeHost || cfg.workerHost,
-    sni: cfg.sni || cfg.workerHost
-  });
-  return `vless://${cfg.uuid}@${host}:443?${params.toString()}#${encodeURIComponent(name)}`;
+    if (!host || typeof host !== "string" || host.trim().length === 0) {
+      return null;
+    }
+    
+    // 确保 UUID 和路径不为空
+    const uuid = cfg.uuid.trim();
+    const wsPath = (cfg.wsPath || "/echws").trim();
+    const workerHost = cfg.workerHost.trim();
+    
+    if (!uuid || uuid.length === 0) {
+      return null;
+    }
+    
+    // 将配置信息编码为 Base64，嵌入到路径中
+    // 格式：/echws/{base64_encoded_config}
+    // 这样即使 v2rayN 忽略查询参数，我们也能从路径中提取配置
+    const configForWs = {
+      h: cfg.backendHost,  // 使用短键名减少长度
+      p: cfg.backendPort,
+      m: cfg.mode || "A"
+    };
+    const configJson = JSON.stringify(configForWs);
+    // 使用 Base64 编码，然后替换特殊字符使其 URL 安全
+    const configB64 = base64Encode(configJson).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    
+    // 构建 WebSocket 路径，将配置编码到路径中
+    // 格式：/echws/{config} 或 /echws/{config}?cfg=... (双重保险)
+    const wsPathWithConfig = `${wsPath}/${configB64}`;
+    
+    // 同时也在查询参数中添加配置（双重保险）
+    const configEncoded = encodeURIComponent(configJson);
+    
+    // 构建参数
+    const params = new URLSearchParams();
+    params.set("encryption", "none");
+    params.set("security", "tls");
+    params.set("type", "ws");
+    params.set("path", wsPathWithConfig);
+    params.set("host", cfg.fakeHost || workerHost);
+    params.set("sni", cfg.sni || workerHost);
+    
+    // 构建 VLESS URL
+    const url = `vless://${uuid}@${host.trim()}:443?${params.toString()}#${encodeURIComponent(name || "Node")}`;
+    
+    // 验证 URL 格式
+    if (!url.startsWith("vless://")) {
+      return null;
+    }
+    
+    return url;
+  } catch (e) {
+    console.error("buildVlessUrl error:", e);
+    return null;
+  }
 }
 
 // ===============================================================
@@ -838,6 +1250,12 @@ function buildVlessUrl(cfg, hostOverride = null, name = "Node") {
 // ===============================================================
 function generateV2raySub(cfg, ipOption) {
   const list = [];
+  
+  // 验证配置对象
+  if (!cfg || typeof cfg !== "object") {
+    return "";
+  }
+  
   ipOption = ipOption || { mode: "domain", ips: [] };
   const mode = ipOption.mode || "domain";
   const ips = Array.isArray(ipOption.ips) ? ipOption.ips : (ipOption.ip ? [ipOption.ip] : []);
@@ -846,11 +1264,17 @@ function generateV2raySub(cfg, ipOption) {
 
   // 1）域名节点（非 ip-only 模式才添加）
   if (!ipOnly) {
-    list.push(buildVlessUrl(cfg, null, "主节点"));
+    const mainUrl = buildVlessUrl(cfg, null, "主节点");
+    if (mainUrl && mainUrl.trim().length > 0) {
+      list.push(mainUrl);
+    }
     if (cfg.nodes && Array.isArray(cfg.nodes)) {
       cfg.nodes.forEach(function(n) {
-        if (!n.host) return;
-        list.push(buildVlessUrl(cfg, n.host, n.name || n.host));
+        if (!n || !n.host) return;
+        const nodeUrl = buildVlessUrl(cfg, n.host, n.name || n.host);
+        if (nodeUrl && nodeUrl.trim().length > 0) {
+          list.push(nodeUrl);
+        }
       });
     }
   }
@@ -858,13 +1282,18 @@ function generateV2raySub(cfg, ipOption) {
   // 2）IP 备胎节点
   if ((mode === "dual" || mode === "ip") && ips.length) {
     ips.forEach(function(ip, idx) {
-      if (!ip) return;
+      if (!ip || typeof ip !== "string" || ip.trim().length === 0) return;
       const name = "优选IP节点" + (ips.length > 1 ? (idx + 1) : "");
-      list.push(buildVlessUrl(cfg, ip, name));
+      const ipUrl = buildVlessUrl(cfg, ip.trim(), name);
+      if (ipUrl && ipUrl.trim().length > 0) {
+        list.push(ipUrl);
+      }
     });
   }
 
-  return list.join("\n");
+  // 过滤掉空字符串和无效 URL
+  const validList = list.filter(url => url && url.trim().length > 0 && url.startsWith("vless://"));
+  return validList.join("\n");
 }
 
 // 根据 Cloudflare colo 返回一个推荐 IP 列表（示例，可按需调整为你实测的 IP）
@@ -906,6 +1335,210 @@ function pickIpListByColo(colo) {
 function pickIpByColo(colo) {
   const list = pickIpListByColo(colo);
   return list && list.length ? list[0] : "188.114.96.3";
+}
+
+function renderHealthPage(health) {
+  const statusColor = health.status === "ok" ? "green" : health.status === "warning" ? "yellow" : "red";
+  const statusIcon = health.status === "ok" ? "✅" : health.status === "warning" ? "⚠️" : "❌";
+  const statusBg = health.status === "ok" ? "bg-green-50 border-green-200" : health.status === "warning" ? "bg-yellow-50 border-yellow-200" : "bg-red-50 border-red-200";
+  
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>Worker 健康检查</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"><\/script>
+  <style>
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .status-ok { background: #10b981; color: white; }
+    .status-warning { background: #f59e0b; color: white; }
+    .status-error { background: #ef4444; color: white; }
+    .info-card {
+      background: white;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      margin-bottom: 16px;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .info-row:last-child {
+      border-bottom: none;
+    }
+    .info-label {
+      font-weight: 600;
+      color: #6b7280;
+    }
+    .info-value {
+      color: #111827;
+      font-family: monospace;
+    }
+    .check-icon { color: #10b981; }
+    .cross-icon { color: #ef4444; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-100 p-4">
+  <div class="max-w-4xl mx-auto space-y-6">
+    <!-- 标题和状态 -->
+    <div class="info-card ${statusBg}">
+      <div class="flex items-center justify-between mb-4">
+        <h1 class="text-2xl font-bold">🔍 Worker 健康检查</h1>
+        <span class="status-badge status-${health.status}">
+          ${statusIcon} ${health.status === "ok" ? "运行正常" : health.status === "warning" ? "配置警告" : "运行异常"}
+        </span>
+      </div>
+      <p class="text-lg font-semibold mb-2">${health.message}</p>
+      <p class="text-sm text-gray-600">检查时间：${new Date(health.timestamp).toLocaleString('zh-CN')}</p>
+    </div>
+
+    <!-- Worker 信息 -->
+    <div class="info-card">
+      <h2 class="text-xl font-semibold mb-4">📦 Worker 信息</h2>
+      <div class="info-row">
+        <span class="info-label">名称</span>
+        <span class="info-value">${health.worker.name}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">版本</span>
+        <span class="info-value">${health.worker.version}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">运行状态</span>
+        <span class="info-value">${health.worker.uptime}</span>
+      </div>
+    </div>
+
+    <!-- 配置状态 -->
+    <div class="info-card">
+      <h2 class="text-xl font-semibold mb-4">⚙️ 配置状态</h2>
+      <div class="info-row">
+        <span class="info-label">UUID</span>
+        <span class="info-value">${health.config.hasUuid ? '<span class="check-icon">✓ 已配置</span>' : '<span class="cross-icon">✗ 未配置</span>'}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Worker 域名</span>
+        <span class="info-value">${health.config.hasWorkerHost ? '<span class="check-icon">✓ 已配置</span>' : '<span class="cross-icon">✗ 未配置</span>'}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">后端域名</span>
+        <span class="info-value">${health.config.hasBackendHost ? '<span class="check-icon">✓ 已配置</span>' : '<span class="cross-icon">✗ 未配置</span>'}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">后端端口</span>
+        <span class="info-value">${health.config.hasBackendPort ? '<span class="check-icon">✓ 已配置</span>' : '<span class="cross-icon">✗ 未配置</span>'}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">WebSocket 路径</span>
+        <span class="info-value">${health.config.wsPath}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">代理模式</span>
+        <span class="info-value">${health.config.mode === "A" ? "方式 A（稳定型）" : "方式 B（高级混淆）"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">配置完整性</span>
+        <span class="info-value">${health.config.configured ? '<span class="check-icon">✓ 完整</span>' : '<span class="cross-icon">✗ 不完整</span>'}</span>
+      </div>
+    </div>
+
+    <!-- 网络信息 -->
+    <div class="info-card">
+      <h2 class="text-xl font-semibold mb-4">🌐 网络信息</h2>
+      <div class="info-row">
+        <span class="info-label">访问 IP</span>
+        <span class="info-value">${health.network.ip || "-"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">国家/地区</span>
+        <span class="info-value">${health.network.country || "-"} / ${health.network.region || "-"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">城市</span>
+        <span class="info-value">${health.network.city || "-"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Cloudflare 入口机房</span>
+        <span class="info-value font-bold">${health.network.colo || "-"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">ASN</span>
+        <span class="info-value">${health.network.asn || "-"}</span>
+      </div>
+    </div>
+
+    <!-- 可用端点 -->
+    <div class="info-card">
+      <h2 class="text-xl font-semibold mb-4">🔗 可用端点</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <a href="${health.endpoints.subscription}" class="p-3 bg-blue-50 rounded-lg hover:bg-blue-100 transition">
+          <div class="font-semibold text-blue-900">订阅链接</div>
+          <div class="text-sm text-blue-600">${health.endpoints.subscription}</div>
+        </a>
+        <a href="${health.endpoints.admin}" class="p-3 bg-green-50 rounded-lg hover:bg-green-100 transition">
+          <div class="font-semibold text-green-900">管理面板</div>
+          <div class="text-sm text-green-600">${health.endpoints.admin}</div>
+        </a>
+        <a href="${health.endpoints.geo}" class="p-3 bg-purple-50 rounded-lg hover:bg-purple-100 transition">
+          <div class="font-semibold text-purple-900">Geo 信息</div>
+          <div class="text-sm text-purple-600">${health.endpoints.geo}</div>
+        </a>
+        <a href="${health.endpoints.singbox}" class="p-3 bg-orange-50 rounded-lg hover:bg-orange-100 transition">
+          <div class="font-semibold text-orange-900">SingBox</div>
+          <div class="text-sm text-orange-600">${health.endpoints.singbox}</div>
+        </a>
+        <a href="${health.endpoints.clash}" class="p-3 bg-pink-50 rounded-lg hover:bg-pink-100 transition">
+          <div class="font-semibold text-pink-900">Clash</div>
+          <div class="text-sm text-pink-600">${health.endpoints.clash}</div>
+        </a>
+        <a href="${health.endpoints.qrcode}" class="p-3 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition">
+          <div class="font-semibold text-indigo-900">二维码</div>
+          <div class="text-sm text-indigo-600">${health.endpoints.qrcode}</div>
+        </a>
+      </div>
+    </div>
+
+    <!-- 操作按钮 -->
+    <div class="info-card">
+      <div class="flex gap-3 flex-wrap">
+        <a href="/" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+          前往管理面板
+        </a>
+        <a href="/api/geo" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition">
+          查看线路信息
+        </a>
+        <a href="/health?format=json" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition">
+          查看 JSON 格式
+        </a>
+        <button onclick="location.reload()" class="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition">
+          刷新页面
+        </button>
+      </div>
+    </div>
+
+    <!-- JSON 数据（可折叠） -->
+    <div class="info-card">
+      <details>
+        <summary class="cursor-pointer font-semibold text-gray-700 hover:text-gray-900">
+          📄 查看原始 JSON 数据
+        </summary>
+        <pre class="mt-4 p-4 bg-gray-900 text-green-400 rounded-lg overflow-x-auto text-xs"><code>${JSON.stringify(health, null, 2)}</code></pre>
+      </details>
+    </div>
+  </div>
+</body>
+</html>`;
 }
 
 function renderSpeedtestPage() {
@@ -1194,9 +1827,33 @@ async function handleWS(request, cfg) {
 
 // --- Mode A: Stable ---
 async function handleWS_A(request, cfg) {
-  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${cfg.wsPath}`;
-  const headers = new Headers(request.headers);
+  const wsPath = cfg.wsPath || "/echws";
+  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${wsPath}`;
+  
+  // 创建新的 headers，保留必要的 WebSocket 升级头
+  const headers = new Headers();
+  
+  // 保留 WebSocket 升级相关的 headers
+  const upgradeHeader = request.headers.get("Upgrade");
+  const connectionHeader = request.headers.get("Connection");
+  const secWebSocketKey = request.headers.get("Sec-WebSocket-Key");
+  const secWebSocketVersion = request.headers.get("Sec-WebSocket-Version");
+  const secWebSocketProtocol = request.headers.get("Sec-WebSocket-Protocol");
+  const secWebSocketExtensions = request.headers.get("Sec-WebSocket-Extensions");
+  
+  if (upgradeHeader) headers.set("Upgrade", upgradeHeader);
+  if (connectionHeader) headers.set("Connection", connectionHeader);
+  if (secWebSocketKey) headers.set("Sec-WebSocket-Key", secWebSocketKey);
+  if (secWebSocketVersion) headers.set("Sec-WebSocket-Version", secWebSocketVersion);
+  if (secWebSocketProtocol) headers.set("Sec-WebSocket-Protocol", secWebSocketProtocol);
+  if (secWebSocketExtensions) headers.set("Sec-WebSocket-Extensions", secWebSocketExtensions);
+  
+  // 设置后端 Host
   headers.set("Host", cfg.backendHost);
+  
+  // 保留 Origin（如果需要）
+  const origin = request.headers.get("Origin");
+  if (origin) headers.set("Origin", origin);
 
   const backendReq = new Request(backendUrl, {
     method: request.method,
@@ -1207,23 +1864,60 @@ async function handleWS_A(request, cfg) {
   let resp;
   try {
     resp = await fetch(backendReq);
+    console.log("WebSocket Mode A: Backend response status:", resp.status);
   } catch (e) {
-    return new Response("Backend connection failed (mode A)", { status: 502 });
+    console.error("WebSocket Mode A: Backend connection failed:", e.message);
+    return new Response("Backend connection failed: " + e.message, { status: 502 });
   }
 
   if (resp.status !== 101) {
-    return new Response("WebSocket upgrade failed (mode A)", { status: 502 });
+    const errorText = await resp.text().catch(() => "Unknown error");
+    console.error("WebSocket Mode A: Upgrade failed, status:", resp.status, "response:", errorText.substring(0, 200));
+    return new Response(`WebSocket upgrade failed: ${resp.status} - ${errorText.substring(0, 100)}`, { status: 502 });
   }
   return resp;
 }
 
 // --- Mode B: Obfuscated ---
 async function handleWS_B(request, cfg) {
-  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${cfg.wsPath}`;
-  const headers = new Headers(request.headers);
+  // 从 URL 中提取原始路径
+  const urlPath = new URL(request.url).pathname;
+  // 提取实际的 WebSocket 路径（去除配置部分）
+  // 路径格式可能是：/echws/{config} 或 /echws
+  let wsPath = cfg.wsPath || "/echws";
+  if (urlPath.startsWith("/echws")) {
+    // 如果路径是 /echws/{config}，提取基础路径
+    const pathParts = urlPath.split('/').filter(p => p);
+    if (pathParts[0] === 'echws') {
+      wsPath = "/echws";  // 使用基础路径
+    }
+  }
+  
+  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${wsPath}`;
+  
+  // 创建新的 headers
+  const headers = new Headers();
+  
+  // 保留 WebSocket 升级相关的 headers
+  const upgradeHeader = request.headers.get("Upgrade");
+  const connectionHeader = request.headers.get("Connection");
+  const secWebSocketKey = request.headers.get("Sec-WebSocket-Key");
+  const secWebSocketVersion = request.headers.get("Sec-WebSocket-Version");
+  const secWebSocketProtocol = request.headers.get("Sec-WebSocket-Protocol");
+  const secWebSocketExtensions = request.headers.get("Sec-WebSocket-Extensions");
+  
+  if (upgradeHeader) headers.set("Upgrade", upgradeHeader);
+  if (connectionHeader) headers.set("Connection", connectionHeader);
+  if (secWebSocketKey) headers.set("Sec-WebSocket-Key", secWebSocketKey);
+  if (secWebSocketVersion) headers.set("Sec-WebSocket-Version", secWebSocketVersion);
+  if (secWebSocketProtocol) headers.set("Sec-WebSocket-Protocol", secWebSocketProtocol);
+  if (secWebSocketExtensions) headers.set("Sec-WebSocket-Extensions", secWebSocketExtensions);
 
+  // 混淆设置
   if (cfg.fakeHost) {
     headers.set("Host", cfg.fakeHost);
+  } else {
+    headers.set("Host", cfg.backendHost);
   }
   if (cfg.ua) {
     headers.set("User-Agent", cfg.ua);
@@ -1234,6 +1928,10 @@ async function handleWS_B(request, cfg) {
 
   headers.set("X-Forwarded-For", "1.1.1.1");
   headers.set("X-Real-IP", "1.1.1.1");
+  
+  // 保留 Origin（如果需要）
+  const origin = request.headers.get("Origin");
+  if (origin) headers.set("Origin", origin);
 
   const backendReq = new Request(backendUrl, {
     method: request.method,
@@ -1244,12 +1942,16 @@ async function handleWS_B(request, cfg) {
   let resp;
   try {
     resp = await fetch(backendReq);
+    console.log("WebSocket Mode B: Backend response status:", resp.status);
   } catch (e) {
-    return new Response("Backend connection failed (mode B)", { status: 503 });
+    console.error("WebSocket Mode B: Backend connection failed:", e.message);
+    return new Response("Backend connection failed: " + e.message, { status: 503 });
   }
 
   if (resp.status !== 101) {
-    return new Response("WebSocket upgrade failed (mode B)", { status: 502 });
+    const errorText = await resp.text().catch(() => "Unknown error");
+    console.error("WebSocket Mode B: Upgrade failed, status:", resp.status, "response:", errorText.substring(0, 200));
+    return new Response(`WebSocket upgrade failed: ${resp.status} - ${errorText.substring(0, 100)}`, { status: 502 });
   }
   return resp;
 }
