@@ -1,4 +1,4 @@
-ECH-Workers 标准版说明书（A + B 完整内容，无截图）
+ECH-Workers 
 一、介绍
 ECH-Workers 是一个基于 Cloudflare Workers 的 VLESS
 节点管理后台，提供无需服务器、可直接部署的节点面板。
