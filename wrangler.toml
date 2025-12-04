@@ -1,0 +1,9 @@
+name = "ech-worker"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+kv_namespaces = [
+  { binding = "CONFIG_KV", id = "REPLACE_WITH_YOUR_KV_ID" }
+]
+
+workers_dev = true
