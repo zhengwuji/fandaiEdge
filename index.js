@@ -536,11 +536,11 @@ function renderAdminUI() {
     <label class="label">UUID（必填）</label>
     <input id="uuid" class="input" placeholder="请输入 VLESS UUID">
     <label class="label">Worker 域名（必填）</label>
-    <input id="workerHost" class="input" placeholder="例如：ech.firegod.eu.org">
+    <input id="workerHost" class="input" placeholder="例如：ech.xxxxxxx.com">
     <label class="label">WS 路径（必填）</label>
     <input id="wsPath" class="input" value="/echws">
     <label class="label">后端 VPS 域名（必填）</label>
-    <input id="backendHost" class="input" placeholder="例如：cc1.firegod.eu.org">
+    <input id="backendHost" class="input" placeholder="例如：cc1.xxxxxxx.com">
     <label class="label">后端端口（必填）</label>
     <input id="backendPort" class="input" value="2082">
     <p class="text-xs text-slate-500">后端端口为 Xray WS 入站端口（无需 TLS）。本 Worker 将通过 ws:// 后端转发客户端流量。</p>
@@ -584,7 +584,7 @@ function renderAdminUI() {
       <button id="addNode" class="btn2">➕ 添加节点</button>
     </h2>
     <div id="nodes"></div>
-    <p class="text-xs text-slate-500 mt-2">你可以在这里添加多个前端节点域名，例如：ech1.firegod.eu.org、ech2.firegod.eu.org。</p>
+    <p class="text-xs text-slate-500 mt-2">你可以在这里添加多个前端节点域名，例如：ech1.xxxxxxx.com、ech2.xxxxxxx.com。</p>
   </div>
 
   <!-- 保存 & 重置 -->
@@ -682,7 +682,7 @@ function renderAdminUI() {
       div.className = "p-3 border rounded-lg mb-3";
       var html = ""
         + '<label class="label">节点域名</label>'
-        + '<input class="input node-host" placeholder="例如：ech2.firegod.eu.org" value="' + (d.host || "") + '">'
+        + '<input class="input node-host" placeholder="例如：ech2.xxxxxxx.com" value="' + (d.host || "") + '">'
         + '<label class="label">备注（可选）</label>'
         + '<input class="input node-name" placeholder="例如：新加坡节点" value="' + (d.name || "") + '">'
         + '<button class="btn2 remove mt-2">删除节点</button>';
