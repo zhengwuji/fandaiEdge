@@ -285,12 +285,21 @@ export default {
       }
 
       // 返回 HTML UI
-      return new Response(renderHealthPage(health), {
-        headers: { 
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-cache, no-store, must-revalidate"
-        }
-      });
+      try {
+        const html = renderHealthPage(health, request);
+        return new Response(html, {
+          headers: { 
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-cache, no-store, must-revalidate"
+          }
+        });
+      } catch (e) {
+        console.error("renderHealthPage error:", e);
+        return new Response("健康检查页面渲染失败: " + e.message, {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8" }
+        });
+      }
     }
 
     // --- Geo info API (线路探测 + 节点评分 + 优选建议) ---
@@ -305,13 +314,23 @@ export default {
       };
 
       const colo = (info.colo || "").toUpperCase();
+      const cfg = await loadConfig(request, url, sessionSecret);
+      const enablePreferredIP = cfg && cfg.enablePreferredIP;
+      
       let score = "C";
       let comment = "线路一般，可以考虑更换 Cloudflare IP 或区域。";
       let ipSuggestions = [];
+      let autoSwitched = false;
+      let recommendedIPs = [];
 
-      if (["HKG","TPE","NRT","KIX","ICN","SIN"].includes(colo)) {
+      if (["HKG","TPE","NRT","KIX","ICN","SIN","SEL"].includes(colo)) {
         score = "A";
-        comment = "非常适合中国大陆访问（亚洲节点，就近接入）。建议保留当前 IP，但可在同段内优选更稳节点。";
+        comment = "非常适合中国大陆访问（亚洲节点，就近接入）。";
+        if (enablePreferredIP) {
+          comment += "已启用优选IP功能，订阅将自动包含优选IP节点以提升稳定性。";
+        } else {
+          comment += "建议保留当前 IP，但可在同段内优选更稳节点。";
+        }
         ipSuggestions = [
           "188.114.96.0/20 （常见优选，适合港/台/新）",
           "104.16.0.0/13",
@@ -319,15 +338,78 @@ export default {
         ];
       } else if (["LAX","SJC","SEA","ORD","DFW","IAD","JFK"].includes(colo)) {
         score = "B";
-        comment = "落在北美节点，延迟略高但可用。建议改用更易落香港/台湾的新 IP。";
-        ipSuggestions = [
-          "188.114.96.0/20 （尝试改绑到该段，再测试是否转向 HKG/TPE）",
-          "141.101.64.0/18",
-          "104.24.0.0/14"
-        ];
+        if (enablePreferredIP) {
+          // 尝试获取推荐的亚洲节点IP
+          try {
+            recommendedIPs = await pickIpListByColo(colo, cfg);
+            if (recommendedIPs.length > 0) {
+              autoSwitched = true;
+              
+              // 统计HKG/TPE的数量
+              const hkgTpeCount = recommendedIPs.filter(item => {
+                const itemColo = typeof item === "string" ? "" : (item.colo || "");
+                return itemColo.toUpperCase() === "HKG" || itemColo.toUpperCase() === "TPE";
+              }).length;
+              
+              if (hkgTpeCount > 0) {
+                // 已成功采用香港/台湾IP
+                comment = `✅ 已成功采用！检测到北美节点(${colo})，优选IP功能已自动启用。订阅已包含${recommendedIPs.length}个优选IP节点（其中${hkgTpeCount}个为香港/台湾节点），客户端将优先使用这些节点以获得更好的连接速度。`;
+                // 更新ipSuggestions，显示已采用的信息
+                ipSuggestions = [
+                  `✅ 已成功采用${hkgTpeCount}个香港/台湾优选IP节点`,
+                  "当前订阅已包含最优节点，无需手动切换",
+                  "如需更多节点，可访问管理面板调整优选IP配置"
+                ];
+              } else {
+                // 有IP但不是HKG/TPE
+                comment = `已检测到北美节点(${colo})，优选IP功能已自动启用。订阅将包含${recommendedIPs.length}个优选IP节点，但未找到香港/台湾节点。建议检查优选IP来源配置。`;
+                ipSuggestions = [
+                  "188.114.96.0/20 （尝试改绑到该段，再测试是否转向 HKG/TPE）",
+                  "141.101.64.0/18",
+                  "104.24.0.0/14"
+                ];
+              }
+            } else {
+              comment = `已检测到北美节点(${colo})，优选IP功能已启用，但未能获取到优选IP。请检查优选IP来源配置。`;
+              ipSuggestions = [
+                "188.114.96.0/20 （尝试改绑到该段，再测试是否转向 HKG/TPE）",
+                "141.101.64.0/18",
+                "104.24.0.0/14"
+              ];
+            }
+          } catch (e) {
+            comment = `已检测到北美节点(${colo})，优选IP功能已启用，但获取优选IP时出错：${e.message}。`;
+            ipSuggestions = [
+              "188.114.96.0/20 （尝试改绑到该段，再测试是否转向 HKG/TPE）",
+              "141.101.64.0/18",
+              "104.24.0.0/14"
+            ];
+          }
+        } else {
+          comment = "落在北美节点，延迟略高但可用。建议启用优选IP功能，系统将自动切换到香港/台湾的优选IP。";
+          ipSuggestions = [
+            "188.114.96.0/20 （尝试改绑到该段，再测试是否转向 HKG/TPE）",
+            "141.101.64.0/18",
+            "104.24.0.0/14"
+          ];
+        }
       } else {
         score = "C";
-        comment = "可能落在较远或冷门节点，建议优选 IP，观察 colo 是否切到 HKG/TPE/NRT/SIN。";
+        if (enablePreferredIP) {
+          try {
+            recommendedIPs = await pickIpListByColo(colo, cfg);
+            if (recommendedIPs.length > 0) {
+              autoSwitched = true;
+              comment = `已检测到非亚洲节点(${colo})，优选IP功能已自动启用。订阅将自动包含${recommendedIPs.length}个优选IP节点。`;
+            } else {
+              comment = `已检测到非亚洲节点(${colo})，优选IP功能已启用，但未能获取到优选IP。`;
+            }
+          } catch (e) {
+            comment = `已检测到非亚洲节点(${colo})，建议启用优选IP功能，观察 colo 是否切到 HKG/TPE/NRT/SIN。`;
+          }
+        } else {
+          comment = "可能落在较远或冷门节点，建议启用优选IP功能，系统将自动切换到亚洲优选IP。";
+        }
         ipSuggestions = [
           "188.114.96.0/20",
           "104.16.0.0/13",
@@ -336,12 +418,21 @@ export default {
         ];
       }
 
-      return new Response(JSON.stringify({
+      const response = {
         ...info,
         score,
         comment,
-        ipSuggestions
-      }, null, 2), {
+        ipSuggestions,
+        enablePreferredIP: enablePreferredIP || false
+      };
+      
+      if (autoSwitched && recommendedIPs.length > 0) {
+        response.autoSwitched = true;
+        response.recommendedIPs = recommendedIPs.slice(0, 5); // 只返回前5个作为示例
+        response.recommendedIPCount = recommendedIPs.length;
+      }
+
+      return new Response(JSON.stringify(response, null, 2), {
         headers: { "content-type": "application/json; charset=utf-8" }
       });
     }
@@ -373,6 +464,16 @@ export default {
     if (pathname === "/sub") {
       try {
       const cfg = await loadConfig(request, url, sessionSecret);
+      
+      console.log("订阅请求 - 配置加载:", {
+        hasUuid: !!cfg?.uuid,
+        hasWorkerHost: !!cfg?.workerHost,
+        hasBackendHost: !!cfg?.backendHost,
+        hasBackendPort: !!cfg?.backendPort,
+        enablePreferredIP: cfg?.enablePreferredIP,
+        hasCookie: !!request.headers.get("Cookie"),
+        hasUrlParam: !!url.searchParams.get("cfg")
+      });
 
         // 验证配置是否完整
         if (!cfg || !cfg.uuid || !cfg.workerHost || !cfg.backendHost || !cfg.backendPort) {
@@ -400,27 +501,151 @@ export default {
             }
           });
         }
+        
+        // 如果配置中没有enablePreferredIP，但检测到非亚洲节点，自动启用
+        const colo = (request.cf && request.cf.colo || "").toUpperCase();
+        const asiaColos = ["HKG", "TPE", "SIN", "NRT", "KIX", "ICN", "SEL"];
+        const isAsiaColo = asiaColos.includes(colo);
+        
+        if (!cfg.enablePreferredIP && !isAsiaColo) {
+          console.log(`检测到非亚洲节点(${colo})，自动启用优选IP功能`);
+          cfg.enablePreferredIP = true;
+          // 设置默认值
+          if (cfg.useWetest === undefined) cfg.useWetest = true;
+          if (cfg.ipv4Enabled === undefined) cfg.ipv4Enabled = true;
+          if (cfg.ipv6Enabled === undefined) cfg.ipv6Enabled = false;
+          if (cfg.ispMobile === undefined) cfg.ispMobile = true;
+          if (cfg.ispUnicom === undefined) cfg.ispUnicom = true;
+          if (cfg.ispTelecom === undefined) cfg.ispTelecom = true;
+        }
 
       // 订阅 IP 模式：
       // ?ip=domain  → 只用域名（默认）
       // ?ip=dual    → 域名 + 多个 IP 备胎节点
       // ?ip=ip/best/colo → 仅 IP 节点（多个备胎 IP）
       const ipParam = url.searchParams.get("ip") || "domain";
-      const colo = (request.cf && request.cf.colo || "").toUpperCase();
-      const ipList = typeof pickIpListByColo === "function"
-        ? pickIpListByColo(colo)
-        : [];
-
-      let ipOption = { mode: "domain", ips: [] };
-      if (ipParam === "dual") {
-        ipOption = { mode: "dual", ips: ipList };
-      } else if (ipParam === "ip" || ipParam === "best" || ipParam === "colo") {
-        ipOption = { mode: "ip", ips: ipList };
-      } else {
-        ipOption = { mode: "domain", ips: [] };
+      
+      // 获取优选IP列表（支持异步动态获取）
+      let ipList = [];
+      if (typeof pickIpListByColo === "function") {
+        try {
+          // pickIpListByColo现在是async函数，需要await
+          ipList = await pickIpListByColo(colo, cfg);
+          console.log(`首次获取优选IP列表: ${ipList.length}个IP`, ipList.slice(0, 3));
+        } catch (e) {
+          console.error("获取优选IP列表失败:", e);
+          ipList = [];
+        }
       }
 
+      // 如果启用了优选IP功能，自动切换到包含优选IP的模式
+      let finalIpParam = ipParam;
+      if (cfg && cfg.enablePreferredIP) {
+        // 如果用户没有指定ip参数，或者指定的是domain，自动切换到dual模式
+        // 这样会包含1个原始域名节点 + 多个优选IP节点
+        if (ipParam === "domain" || !ipParam) {
+          finalIpParam = "dual";
+          console.log("自动切换到dual模式（域名+优选IP）");
+        }
+        
+        // 如果IP列表为空或不足，尝试获取更多
+        const targetIPCount = 10;
+        if (ipList.length < targetIPCount) {
+          try {
+            // 如果当前IP列表为空，重新获取
+            if (ipList.length === 0) {
+              console.log("IP列表为空，重新获取...");
+              ipList = await pickIpListByColo(colo, cfg);
+              console.log(`重新获取后IP列表: ${ipList.length}个IP`, ipList.slice(0, 3));
+            }
+            
+            // 如果还是不足，尝试再次获取（可能获取到不同的IP）
+            if (ipList.length < targetIPCount) {
+              console.log(`IP数量不足(${ipList.length}/${targetIPCount})，尝试获取更多...`);
+              const moreIPs = await pickIpListByColo(colo, cfg);
+              console.log(`获取到额外${moreIPs.length}个IP`);
+              
+              // 去重并合并（处理对象格式的IP）
+              const ipMap = new Map();
+              // 先添加现有的IP
+              ipList.forEach(item => {
+                const ip = typeof item === "string" ? item : item.ip;
+                if (ip && !ipMap.has(ip)) {
+                  ipMap.set(ip, typeof item === "string" ? { ip: ip, colo: "" } : item);
+                }
+              });
+              // 再添加新获取的IP
+              moreIPs.forEach(item => {
+                const ip = typeof item === "string" ? item : item.ip;
+                if (ip && !ipMap.has(ip)) {
+                  ipMap.set(ip, typeof item === "string" ? { ip: ip, colo: "" } : item);
+                }
+              });
+              
+              ipList = Array.from(ipMap.values()).slice(0, targetIPCount);
+              console.log(`合并后IP列表: ${ipList.length}个IP`);
+            }
+          } catch (e) {
+            console.error("获取更多优选IP失败:", e);
+          }
+        } else if (ipList.length > targetIPCount) {
+          // 如果超过10个，只取前10个
+          ipList = ipList.slice(0, targetIPCount);
+        }
+        
+        // 如果仍然没有IP，使用静态IP列表作为后备
+        if (ipList.length === 0) {
+          console.log("动态IP获取失败，使用静态IP列表作为后备");
+          const staticIPs = pickIpListByColoStatic(colo);
+          ipList = staticIPs;
+          console.log(`使用静态IP列表: ${ipList.length}个IP`, ipList);
+        }
+        
+        // 统计HKG/TPE的数量
+        const hkgTpeCount = ipList.filter(item => {
+          const itemColo = typeof item === "string" ? "" : (item.colo || "");
+          return itemColo.toUpperCase() === "HKG" || itemColo.toUpperCase() === "TPE";
+        }).length;
+        
+        console.log(`最终IP列表: ${ipList.length}个IP（其中${hkgTpeCount}个为香港/台湾节点）`, 
+          ipList.slice(0, 3).map(item => {
+            const ip = typeof item === "string" ? item : item.ip;
+            const colo = typeof item === "string" ? "" : (item.colo || "");
+            return `${ip}(${getCountryNameByColo(colo)})`;
+          })
+        );
+        
+        if (ipList.length > 0) {
+          if (hkgTpeCount > 0) {
+            console.log(`✅ 已启用优选IP功能，自动切换到dual模式，包含1个原始域名节点 + ${ipList.length}个优选IP节点（${hkgTpeCount}个香港/台湾节点）`);
+          } else {
+            console.warn(`⚠️ 已启用优选IP功能，但未找到香港/台湾节点，包含${ipList.length}个其他地区优选IP节点`);
+          }
+        } else {
+          console.warn("⚠️ 警告：启用优选IP功能但未能获取到任何IP，订阅将只包含域名节点");
+        }
+      } else {
+        console.log("优选IP功能未启用，使用domain模式");
+      }
+
+      let ipOption = { mode: "domain", ips: [] };
+      if (finalIpParam === "dual") {
+        // dual模式：1个原始域名节点 + 多个优选IP节点
+        ipOption = { mode: "dual", ips: ipList };
+        console.log(`设置ipOption为dual模式，IP数量: ${ipList.length}`, ipList.slice(0, 3));
+      } else if (finalIpParam === "ip" || finalIpParam === "best" || finalIpParam === "colo") {
+        // ip模式：仅优选IP节点（不包含原始域名）
+        ipOption = { mode: "ip", ips: ipList };
+        console.log(`设置ipOption为ip模式，IP数量: ${ipList.length}`);
+      } else {
+        // domain模式：仅原始域名节点
+        ipOption = { mode: "domain", ips: [] };
+        console.log(`设置ipOption为domain模式，不包含IP节点`);
+      }
+
+      console.log(`开始生成订阅，ipOption:`, JSON.stringify({ mode: ipOption.mode, ipCount: ipOption.ips.length }));
       const str = generateV2raySub(cfg, ipOption);
+      console.log(`订阅生成完成，包含${str.split('\\n').filter(l => l.trim()).length}个节点`);
         
         // 如果生成的订阅为空，记录日志并返回空字符串
         if (!str || str.trim().length === 0) {
@@ -833,6 +1058,66 @@ function renderAdminUI() {
     <p class="text-xs text-slate-500">当 WS 模式选择为 B 时，这些字段将用于伪装请求头。</p>
   </div>
 
+  <!-- 优选IP配置 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4">优选IP功能配置</h2>
+    <div class="mb-4">
+      <label class="flex items-center mb-2">
+        <input type="checkbox" id="enablePreferredIP" class="mr-2">
+        <span>启用优选IP功能</span>
+      </label>
+      <p class="text-xs text-slate-500 ml-6">启用后，订阅将自动包含从多个来源获取的优选IP节点，提升连接速度和稳定性。</p>
+    </div>
+    
+    <div id="preferredIPConfig" style="display: none;">
+      <label class="label">优选IP来源URL（可选）</label>
+      <input id="preferredIPsUrl" class="input" placeholder="留空则使用默认wetest地址">
+      <p class="text-xs text-slate-500 mb-3">自定义优选IP来源URL，支持HTML页面或文本格式（格式：IP:端口#名称 或 wetest HTML格式）</p>
+      
+      <div class="mb-3">
+        <label class="flex items-center mb-2">
+          <input type="checkbox" id="useWetest" class="mr-2" checked>
+          <span>使用wetest默认源</span>
+        </label>
+        <p class="text-xs text-slate-500 ml-6">当自定义URL失败时，自动回退到wetest默认源</p>
+      </div>
+      
+      <div class="mb-3">
+        <label class="flex items-center mb-2">
+          <input type="checkbox" id="ipv4Enabled" class="mr-2" checked>
+          <span>启用IPv4</span>
+        </label>
+      </div>
+      
+      <div class="mb-3">
+        <label class="flex items-center mb-2">
+          <input type="checkbox" id="ipv6Enabled" class="mr-2">
+          <span>启用IPv6</span>
+        </label>
+      </div>
+      
+      <p class="text-sm font-semibold mb-2">运营商筛选：</p>
+      <div class="mb-2">
+        <label class="flex items-center">
+          <input type="checkbox" id="ispMobile" class="mr-2" checked>
+          <span>移动</span>
+        </label>
+      </div>
+      <div class="mb-2">
+        <label class="flex items-center">
+          <input type="checkbox" id="ispUnicom" class="mr-2" checked>
+          <span>联通</span>
+        </label>
+      </div>
+      <div class="mb-2">
+        <label class="flex items-center">
+          <input type="checkbox" id="ispTelecom" class="mr-2" checked>
+          <span>电信</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
   <!-- 多节点 -->
   <div class="card mb-6">
     <h2 class="text-xl font-semibold mb-4 flex justify-between">
@@ -903,6 +1188,22 @@ function renderAdminUI() {
       document.getElementById("sni").value = cfg.sni || "";
       document.getElementById("ua").value = cfg.ua || "";
 
+      // 加载优选IP配置
+      document.getElementById("enablePreferredIP").checked = cfg.enablePreferredIP || false;
+      document.getElementById("preferredIPsUrl").value = cfg.preferredIPsUrl || "";
+      document.getElementById("useWetest").checked = cfg.useWetest !== false;
+      document.getElementById("ipv4Enabled").checked = cfg.ipv4Enabled !== false;
+      document.getElementById("ipv6Enabled").checked = cfg.ipv6Enabled || false;
+      document.getElementById("ispMobile").checked = cfg.ispMobile !== false;
+      document.getElementById("ispUnicom").checked = cfg.ispUnicom !== false;
+      document.getElementById("ispTelecom").checked = cfg.ispTelecom !== false;
+      
+      // 根据启用状态显示/隐藏配置选项
+      var preferredIPConfig = document.getElementById("preferredIPConfig");
+      if (preferredIPConfig) {
+        preferredIPConfig.style.display = cfg.enablePreferredIP ? "block" : "none";
+      }
+
       if (cfg.mode === "B") {
         var b = document.querySelector("input[name='wsMode'][value='B']");
         if (b) b.checked = true;
@@ -934,9 +1235,59 @@ function renderAdminUI() {
         document.getElementById("geoLocation").textContent = locText;
         document.getElementById("geoColo").textContent = "当前 Worker 落地机房（colo）：" + (geo.colo || "-");
         document.getElementById("geoScore").textContent = "线路评分：" + (geo.score || "-");
-        document.getElementById("geoComment").textContent = geo.comment || "";
+        
+        // 显示评论，检查是否已成功采用
+        var commentText = geo.comment || "";
+        var isSuccess = commentText.includes("✅ 已成功采用") || commentText.includes("已成功采用");
+        
+        // 设置样式
+        if (isSuccess) {
+          document.getElementById("geoComment").style.color = "#10b981";
+          document.getElementById("geoComment").style.fontWeight = "600";
+          document.getElementById("geoComment").style.fontSize = "14px";
+        } else if (geo.autoSwitched && geo.recommendedIPCount) {
+          document.getElementById("geoComment").style.color = "#10b981";
+          document.getElementById("geoComment").style.fontWeight = "600";
+          commentText += " ✅ 已自动切换到" + geo.recommendedIPCount + "个优选IP节点！";
+        } else {
+          document.getElementById("geoComment").style.color = "";
+          document.getElementById("geoComment").style.fontWeight = "";
+        }
+        
+        document.getElementById("geoComment").textContent = commentText;
+        
+        // 显示IP建议（如果已成功采用，显示确认信息；否则显示建议）
         if (geo.ipSuggestions && geo.ipSuggestions.length) {
-          document.getElementById("geoIps").textContent = geo.ipSuggestions.join(", ");
+          var suggestionsText = geo.ipSuggestions.join(", ");
+          // 如果包含"已成功采用"，使用绿色显示
+          if (suggestionsText.includes("✅ 已成功采用") || suggestionsText.includes("已成功采用")) {
+            document.getElementById("geoIps").style.color = "#10b981";
+            document.getElementById("geoIps").style.fontWeight = "600";
+            document.getElementById("geoIps").innerHTML = geo.ipSuggestions.map(function(s) {
+              return s.includes("✅") ? s : "• " + s;
+            }).join("<br>");
+          } else {
+            document.getElementById("geoIps").style.color = "";
+            document.getElementById("geoIps").style.fontWeight = "";
+            document.getElementById("geoIps").textContent = suggestionsText;
+          }
+        }
+        
+        // 如果显示了推荐的IP，也显示出来
+        if (geo.recommendedIPs && geo.recommendedIPs.length > 0) {
+          var recommendedText = "已推荐的优选IP节点（前5个）：";
+          var ipList = geo.recommendedIPs.map(function(item) {
+            if (typeof item === "string") {
+              return item;
+            } else {
+              return item.ip + (item.colo ? " (" + item.colo + ")" : "");
+            }
+          });
+          recommendedText += ipList.join(", ");
+          var recommendedEl = document.createElement("p");
+          recommendedEl.className = "text-xs text-green-600 font-semibold mt-2";
+          recommendedEl.textContent = recommendedText;
+          document.getElementById("geoIps").parentElement.appendChild(recommendedEl);
         }
       } catch(e) {
         document.getElementById("geoLocation").textContent = "无法获取 Geo 信息（可能是浏览器或网络限制）。";
@@ -959,6 +1310,14 @@ function renderAdminUI() {
     }
 
     document.getElementById("addNode").onclick = function(){ addNodeUI(); };
+
+    // 优选IP功能开关事件
+    document.getElementById("enablePreferredIP").onchange = function() {
+      var preferredIPConfig = document.getElementById("preferredIPConfig");
+      if (preferredIPConfig) {
+        preferredIPConfig.style.display = this.checked ? "block" : "none";
+      }
+    };
 
     document.getElementById("save").onclick = async function () {
       var modeInput = document.querySelector("input[name='wsMode']:checked");
@@ -987,6 +1346,16 @@ function renderAdminUI() {
         });
       });
 
+      // 收集优选IP配置
+      var enablePreferredIP = document.getElementById("enablePreferredIP").checked;
+      var preferredIPsUrl = document.getElementById("preferredIPsUrl").value.trim();
+      var useWetest = document.getElementById("useWetest").checked;
+      var ipv4Enabled = document.getElementById("ipv4Enabled").checked;
+      var ipv6Enabled = document.getElementById("ipv6Enabled").checked;
+      var ispMobile = document.getElementById("ispMobile").checked;
+      var ispUnicom = document.getElementById("ispUnicom").checked;
+      var ispTelecom = document.getElementById("ispTelecom").checked;
+
       var cfg = {
         uuid: uuidEl.value,
         workerHost: workerHostEl.value,
@@ -997,7 +1366,15 @@ function renderAdminUI() {
         sni: sniEl.value,
         ua: uaEl.value,
         mode: mode,
-        nodes: nodesData
+        nodes: nodesData,
+        enablePreferredIP: enablePreferredIP,
+        preferredIPsUrl: preferredIPsUrl,
+        useWetest: useWetest,
+        ipv4Enabled: ipv4Enabled,
+        ipv6Enabled: ipv6Enabled,
+        ispMobile: ispMobile,
+        ispUnicom: ispUnicom,
+        ispTelecom: ispTelecom
       };
 
       await fetch("/api/set-config", {
@@ -1140,7 +1517,15 @@ async function loadConfig(request, url, sessionSecret) {
       sni: "",
       ua: "",
       mode: "A",
-      nodes: []
+      nodes: [],
+      enablePreferredIP: false,
+      preferredIPsUrl: "",
+      useWetest: true,
+      ipv4Enabled: true,
+      ipv6Enabled: false,
+      ispMobile: true,
+      ispUnicom: true,
+      ispTelecom: true
     };
   }
   
@@ -1165,7 +1550,15 @@ async function loadConfig(request, url, sessionSecret) {
       sni: "",
       ua: "",
       mode: "A",
-      nodes: []
+      nodes: [],
+      enablePreferredIP: false,
+      preferredIPsUrl: "",
+      useWetest: true,
+      ipv4Enabled: true,
+      ipv6Enabled: false,
+      ispMobile: true,
+      ispUnicom: true,
+      ispTelecom: true
     };
   }
 }
@@ -1262,9 +1655,9 @@ function generateV2raySub(cfg, ipOption) {
 
   const ipOnly = (mode === "ip");
 
-  // 1）域名节点（非 ip-only 模式才添加）
+  // 1）域名节点（非 ip-only 模式才添加，作为原始未优选节点）
   if (!ipOnly) {
-    const mainUrl = buildVlessUrl(cfg, null, "主节点");
+    const mainUrl = buildVlessUrl(cfg, null, "原始节点（未优选）");
     if (mainUrl && mainUrl.trim().length > 0) {
       list.push(mainUrl);
     }
@@ -1279,68 +1672,585 @@ function generateV2raySub(cfg, ipOption) {
     }
   }
 
-  // 2）IP 备胎节点
+  // 2）优选IP节点（dual模式：域名+IP，ip模式：仅IP）
   if ((mode === "dual" || mode === "ip") && ips.length) {
-    ips.forEach(function(ip, idx) {
-      if (!ip || typeof ip !== "string" || ip.trim().length === 0) return;
-      const name = "优选IP节点" + (ips.length > 1 ? (idx + 1) : "");
-      const ipUrl = buildVlessUrl(cfg, ip.trim(), name);
+    // 确保最多10个优选IP节点
+    const maxIPs = 10;
+    const ipListToUse = ips.slice(0, maxIPs);
+    
+    console.log(`生成优选IP节点，模式: ${mode}, IP数量: ${ipListToUse.length}`, ipListToUse.slice(0, 3));
+    
+    let successCount = 0;
+    ipListToUse.forEach(function(ipItem, idx) {
+      // 处理IP可能是字符串或对象的情况
+      let ip = "";
+      let colo = "";
+      
+      if (typeof ipItem === "string") {
+        ip = ipItem.trim();
+      } else if (ipItem && typeof ipItem === "object" && ipItem.ip) {
+        ip = ipItem.ip.trim();
+        colo = ipItem.colo || "";
+      } else {
+        console.warn(`跳过无效IP[${idx}]:`, ipItem);
+        return;
+      }
+      
+      if (!ip || ip.length === 0) {
+        console.warn(`跳过空IP[${idx}]:`, ipItem);
+        return;
+      }
+      
+      // 根据colo生成带国家信息的节点名称
+      let countryName = "";
+      if (colo) {
+        countryName = getCountryNameByColo(colo);
+      }
+      
+      const name = countryName 
+        ? `优选IP节点${idx + 1}-${countryName}`
+        : `优选IP节点${idx + 1}`;
+      
+      const ipUrl = buildVlessUrl(cfg, ip, name);
       if (ipUrl && ipUrl.trim().length > 0) {
         list.push(ipUrl);
+        successCount++;
+      } else {
+        console.error(`生成IP节点URL失败[${idx}]:`, ip, name);
       }
     });
+    
+    console.log(`成功生成${successCount}个优选IP节点URL`);
+    
+    // 如果IP数量不足10个，记录日志
+    if (ipListToUse.length < maxIPs && mode === "dual") {
+      console.log(`优选IP节点数量：${successCount}/${maxIPs}，已包含1个原始域名节点`);
+    }
+  } else if ((mode === "dual" || mode === "ip") && ips.length === 0) {
+    console.warn(`警告：模式为${mode}但IP列表为空，将只包含域名节点`);
   }
 
   // 过滤掉空字符串和无效 URL
   const validList = list.filter(url => url && url.trim().length > 0 && url.startsWith("vless://"));
+  
+  console.log(`generateV2raySub完成，总节点数: ${validList.length}`, {
+    mode: mode,
+    ipCount: ips.length,
+    domainNodes: !ipOnly ? 1 : 0,
+    ipNodes: (mode === "dual" || mode === "ip") ? validList.length - (!ipOnly ? 1 : 0) : 0
+  });
+  
+  if (validList.length === 0) {
+    console.error("警告：生成的订阅列表为空！");
+  }
+  
   return validList.join("\n");
 }
 
-// 根据 Cloudflare colo 返回一个推荐 IP 列表（示例，可按需调整为你实测的 IP）
-function pickIpListByColo(colo) {
+// ===============================================================
+// 优选IP功能核心函数
+// ===============================================================
+
+// 默认优选IP来源URL
+const defaultIPURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
+const wetestV4URL = "https://www.wetest.vip/page/cloudflare/address_v4.html";
+const wetestV6URL = "https://www.wetest.vip/page/cloudflare/address_v6.html";
+
+// Cloudflare colo代码到国家/地区的中文映射
+function getCountryNameByColo(colo) {
+  if (!colo) return "未知";
+  
+  const coloUpper = colo.toUpperCase();
+  const coloMap = {
+    // 亚洲
+    "HKG": "香港",
+    "TPE": "台湾",
+    "SIN": "新加坡",
+    "NRT": "日本东京",
+    "KIX": "日本大阪",
+    "ICN": "韩国首尔",
+    "SEL": "韩国首尔",
+    "BOM": "印度孟买",
+    "DEL": "印度德里",
+    "BKK": "泰国曼谷",
+    "KUL": "马来西亚吉隆坡",
+    "JKT": "印度尼西亚雅加达",
+    "MNL": "菲律宾马尼拉",
+    "HND": "日本东京",
+    "NGO": "日本名古屋",
+    
+    // 北美
+    "LAX": "美国洛杉矶",
+    "SJC": "美国圣何塞",
+    "SEA": "美国西雅图",
+    "ORD": "美国芝加哥",
+    "DFW": "美国达拉斯",
+    "IAD": "美国华盛顿",
+    "JFK": "美国纽约",
+    "MIA": "美国迈阿密",
+    "ATL": "美国亚特兰大",
+    "BOS": "美国波士顿",
+    "YYZ": "加拿大多伦多",
+    "YVR": "加拿大温哥华",
+    
+    // 欧洲
+    "AMS": "荷兰阿姆斯特丹",
+    "FRA": "德国法兰克福",
+    "LHR": "英国伦敦",
+    "CDG": "法国巴黎",
+    "MAD": "西班牙马德里",
+    "FCO": "意大利罗马",
+    "ARN": "瑞典斯德哥尔摩",
+    "OSL": "挪威奥斯陆",
+    "CPH": "丹麦哥本哈根",
+    "VIE": "奥地利维也纳",
+    "ZRH": "瑞士苏黎世",
+    "WAW": "波兰华沙",
+    "DUB": "爱尔兰都柏林",
+    
+    // 大洋洲
+    "SYD": "澳大利亚悉尼",
+    "MEL": "澳大利亚墨尔本",
+    "AKL": "新西兰奥克兰",
+    
+    // 南美
+    "GRU": "巴西圣保罗",
+    "EZE": "阿根廷布宜诺斯艾利斯",
+    "SCL": "智利圣地亚哥",
+    
+    // 其他
+    "DXB": "阿联酋迪拜",
+    "JNB": "南非约翰内斯堡"
+  };
+  
+  return coloMap[coloUpper] || coloUpper;
+}
+
+// 解析wetest页面获取IP列表
+async function fetchAndParseWetest(url) {
+  try {
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!response.ok) return [];
+    const html = await response.text();
+    const results = [];
+    const rowRegex = /<tr[\s\S]*?<\/tr>/g;
+    const cellRegex = /<td data-label="线路名称">(.+?)<\/td>[\s\S]*?<td data-label="优选地址">([\d.:a-fA-F]+)<\/td>[\s\S]*?<td data-label="数据中心">(.+?)<\/td>/;
+
+    let match;
+    while ((match = rowRegex.exec(html)) !== null) {
+      const rowHtml = match[0];
+      const cellMatch = rowHtml.match(cellRegex);
+      if (cellMatch && cellMatch[1] && cellMatch[2]) {
+        const colo = cellMatch[3] ? cellMatch[3].trim().replace(/<.*?>/g, '') : '';
+        results.push({
+          isp: cellMatch[1].trim().replace(/<.*?>/g, ''),
+          ip: cellMatch[2].trim(),
+          colo: colo
+        });
+      }
+    }
+    return results;
+  } catch (error) {
+    return [];
+  }
+}
+
+// 从GitHub获取优选IP
+async function fetchAndParseNewIPs(piu) {
+  const url = piu || defaultIPURL;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return [];
+    const text = await response.text();
+    const results = [];
+    const lines = text.trim().replace(/\r/g, "").split('\n');
+    const regex = /^([^:]+):(\d+)#(.*)$/;
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+      const match = trimmedLine.match(regex);
+      if (match) {
+        results.push({
+          ip: match[1],
+          port: parseInt(match[2], 10),
+          name: match[3].trim() || match[1]
+        });
+      }
+    }
+    return results;
+  } catch (error) {
+    return [];
+  }
+}
+
+// 获取动态IP列表（支持IPv4/IPv6和运营商筛选）
+async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true) {
+  let results = [];
+
+  try {
+    const fetchPromises = [];
+    if (ipv4Enabled) {
+      fetchPromises.push(fetchAndParseWetest(wetestV4URL));
+    } else {
+      fetchPromises.push(Promise.resolve([]));
+    }
+    if (ipv6Enabled) {
+      fetchPromises.push(fetchAndParseWetest(wetestV6URL));
+    } else {
+      fetchPromises.push(Promise.resolve([]));
+    }
+
+    const [ipv4List, ipv6List] = await Promise.all(fetchPromises);
+    results = [...ipv4List, ...ipv6List];
+    
+    // 按运营商筛选
+    if (results.length > 0) {
+      results = results.filter(item => {
+        const isp = item.isp || '';
+        if (isp.includes('移动') && !ispMobile) return false;
+        if (isp.includes('联通') && !ispUnicom) return false;
+        if (isp.includes('电信') && !ispTelecom) return false;
+        return true;
+      });
+    }
+    
+    return results.length > 0 ? results : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// 从自定义URL获取优选IP（yxURL功能）
+async function fetchPreferredIPsFromURL(yxURL, ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true) {
+  if (!yxURL) {
+    return [];
+  }
+  
+  try {
+    const response = await fetch(yxURL, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!response.ok) return [];
+    
+    const contentType = response.headers.get('content-type') || '';
+    let results = [];
+    
+    // 判断是HTML页面还是文本文件
+    if (contentType.includes('text/html')) {
+      // HTML格式，使用wetest解析方式
+      const html = await response.text();
+      const rowRegex = /<tr[\s\S]*?<\/tr>/g;
+      const cellRegex = /<td data-label="线路名称">(.+?)<\/td>[\s\S]*?<td data-label="优选地址">([\d.:a-fA-F]+)<\/td>[\s\S]*?<td data-label="数据中心">(.+?)<\/td>/;
+      
+      let match;
+      while ((match = rowRegex.exec(html)) !== null) {
+        const rowHtml = match[0];
+        const cellMatch = rowHtml.match(cellRegex);
+        if (cellMatch && cellMatch[1] && cellMatch[2]) {
+          const colo = cellMatch[3] ? cellMatch[3].trim().replace(/<.*?>/g, '') : '';
+          const ip = cellMatch[2].trim();
+          // 检查IP版本
+          const isIPv6 = ip.includes(':');
+          if ((isIPv6 && !ipv6Enabled) || (!isIPv6 && !ipv4Enabled)) {
+            continue;
+          }
+          results.push({
+            isp: cellMatch[1].trim().replace(/<.*?>/g, ''),
+            ip: ip,
+            colo: colo
+          });
+        }
+      }
+    } else {
+      // 文本格式，使用GitHub格式解析
+      const text = await response.text();
+      const lines = text.trim().replace(/\r/g, "").split('\n');
+      const regex = /^([^:]+):(\d+)#(.*)$/;
+      
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) continue;
+        const match = trimmedLine.match(regex);
+        if (match) {
+          const ip = match[1];
+          const isIPv6 = ip.includes(':');
+          if ((isIPv6 && !ipv6Enabled) || (!isIPv6 && !ipv4Enabled)) {
+            continue;
+          }
+          results.push({
+            ip: ip,
+            port: parseInt(match[2], 10),
+            name: match[3].trim() || ip,
+            isp: match[3].trim() || ip
+          });
+        }
+      }
+    }
+    
+    // 按运营商筛选
+    if (results.length > 0) {
+      results = results.filter(item => {
+        const isp = item.isp || '';
+        if (isp.includes('移动') && !ispMobile) return false;
+        if (isp.includes('联通') && !ispUnicom) return false;
+        if (isp.includes('电信') && !ispTelecom) return false;
+        return true;
+      });
+    }
+    
+    return results;
+  } catch (error) {
+    console.error('从自定义URL获取优选IP失败:', error);
+    return [];
+  }
+}
+
+// 根据 Cloudflare colo 返回一个推荐 IP 列表（增强版，支持动态获取）
+async function pickIpListByColo(colo, cfg = null) {
   colo = (colo || "").toUpperCase();
+  
+  // 定义亚洲节点列表（优先选择这些节点）
+  const asiaColos = ["HKG", "TPE", "SIN", "NRT", "KIX", "ICN", "SEL"];
+  const isAsiaColo = asiaColos.includes(colo);
+  const targetIPCount = 10; // 目标IP数量
+  
+  // 如果配置中启用了优选IP功能，尝试从动态源获取
+  if (cfg && cfg.enablePreferredIP) {
+    try {
+      let allIPs = [];
+      
+      // 优先使用自定义URL
+      if (cfg.preferredIPsUrl) {
+        const customIPs = await fetchPreferredIPsFromURL(
+          cfg.preferredIPsUrl,
+          cfg.ipv4Enabled !== false,
+          cfg.ipv6Enabled !== false,
+          cfg.ispMobile !== false,
+          cfg.ispUnicom !== false,
+          cfg.ispTelecom !== false
+        );
+        if (customIPs.length > 0) {
+          allIPs = customIPs;
+        }
+      }
+      
+      // 如果自定义URL失败或未设置，尝试从wetest获取
+      if (allIPs.length === 0 && cfg.useWetest !== false) {
+        const dynamicIPs = await fetchDynamicIPs(
+          cfg.ipv4Enabled !== false,
+          cfg.ipv6Enabled !== false,
+          cfg.ispMobile !== false,
+          cfg.ispUnicom !== false,
+          cfg.ispTelecom !== false
+        );
+        if (dynamicIPs.length > 0) {
+          allIPs = dynamicIPs;
+        }
+      }
+      
+      if (allIPs.length > 0) {
+        let selectedIPs = [];
+        
+        // 如果当前是亚洲节点，优先返回匹配当前colo的IP，否则返回亚洲节点IP
+        if (isAsiaColo) {
+          // 当前是亚洲节点，优先返回匹配的IP
+          const coloIPs = allIPs.filter(ip => ip.colo && ip.colo.toUpperCase() === colo);
+          if (coloIPs.length > 0) {
+            selectedIPs = coloIPs;
+          }
+          // 如果数量不足，补充其他亚洲节点IP
+          if (selectedIPs.length < targetIPCount) {
+            const asiaIPs = allIPs.filter(ip => ip.colo && asiaColos.includes(ip.colo.toUpperCase()));
+            const additionalIPs = asiaIPs.filter(ip => !selectedIPs.some(s => s.ip === ip.ip));
+            selectedIPs = [...selectedIPs, ...additionalIPs];
+          }
+        } else {
+          // 当前不是亚洲节点（如LAX），严格优先返回香港和台湾的IP
+          // 第一步：只选择HKG和TPE的IP
+          const hkgTpeIPs = allIPs.filter(ip => {
+            const ipColo = (ip.colo || "").toUpperCase();
+            return ipColo === "HKG" || ipColo === "TPE";
+          });
+          
+          if (hkgTpeIPs.length > 0) {
+            // 优先使用所有可用的HKG/TPE IP，即使不足10个
+            selectedIPs = hkgTpeIPs;
+            console.log(`✅ 找到${hkgTpeIPs.length}个香港/台湾IP节点，将全部使用`);
+            
+            // 如果HKG/TPE的IP不足10个，尝试从静态列表补充
+            if (selectedIPs.length < targetIPCount) {
+              console.log(`香港/台湾IP数量不足(${selectedIPs.length}/${targetIPCount})，从静态列表补充...`);
+              const staticIPs = pickIpListByColoStatic(colo);
+              // 只补充HKG/TPE的静态IP
+              const staticHkgTpe = staticIPs.filter(item => {
+                const itemColo = (item.colo || "").toUpperCase();
+                return (itemColo === "HKG" || itemColo === "TPE") && 
+                       !selectedIPs.some(s => s.ip === item.ip);
+              });
+              
+              if (staticHkgTpe.length > 0) {
+                selectedIPs = [...selectedIPs, ...staticHkgTpe];
+                console.log(`从静态列表补充了${staticHkgTpe.length}个香港/台湾IP`);
+              }
+            }
+          } else {
+            // 如果没有找到HKG/TPE的IP，使用静态列表
+            console.log("⚠️ 未找到香港/台湾IP，使用静态IP列表");
+            const staticIPs = pickIpListByColoStatic(colo);
+            selectedIPs = staticIPs.filter(item => {
+              const itemColo = (item.colo || "").toUpperCase();
+              return itemColo === "HKG" || itemColo === "TPE";
+            });
+            
+            if (selectedIPs.length === 0) {
+              // 如果静态列表也没有HKG/TPE，使用所有静态IP（至少保证有IP可用）
+              console.log("⚠️ 静态列表也没有香港/台湾IP，使用所有静态IP");
+              selectedIPs = staticIPs;
+            }
+          }
+        }
+        
+        // 去重并限制数量（优先保留HKG/TPE的IP）
+        const uniqueIPs = [];
+        const seenIPs = new Set();
+        
+        // 先添加HKG/TPE的IP
+        for (const item of selectedIPs) {
+          const itemColo = (item.colo || "").toUpperCase();
+          if ((itemColo === "HKG" || itemColo === "TPE") && !seenIPs.has(item.ip)) {
+            seenIPs.add(item.ip);
+            uniqueIPs.push(item);
+          }
+        }
+        
+        // 如果HKG/TPE的IP不足10个，补充其他IP（但优先HKG/TPE）
+        if (uniqueIPs.length < targetIPCount) {
+          for (const item of selectedIPs) {
+            if (!seenIPs.has(item.ip)) {
+              seenIPs.add(item.ip);
+              uniqueIPs.push(item);
+              if (uniqueIPs.length >= targetIPCount) break;
+            }
+          }
+        } else {
+          // 如果HKG/TPE的IP已经足够，只取前10个
+          uniqueIPs.splice(targetIPCount);
+        }
+        
+        if (uniqueIPs.length > 0) {
+          // 统计HKG/TPE的数量
+          const hkgTpeCount = uniqueIPs.filter(item => {
+            const itemColo = (item.colo || "").toUpperCase();
+            return itemColo === "HKG" || itemColo === "TPE";
+          }).length;
+          
+          console.log(`最终选择${uniqueIPs.length}个IP节点，其中${hkgTpeCount}个为香港/台湾节点`);
+          
+          // 返回包含IP和colo信息的对象数组
+          return uniqueIPs.map(item => ({
+            ip: item.ip,
+            colo: item.colo || ""
+          }));
+        }
+      }
+    } catch (e) {
+      console.error('获取动态优选IP失败，使用静态IP列表:', e);
+    }
+  }
+  
+  // 静态IP列表（作为后备方案）
+  // 返回静态IP列表（同步函数，用于后备）
+  return pickIpListByColoStatic(colo);
+}
+
+// 静态IP列表函数（同步，用于后备）
+function pickIpListByColoStatic(colo) {
+  colo = (colo || "").toUpperCase();
+  
+  // 如果当前是北美节点，返回更多亚洲节点IP（用于自动切换）
+  if (["LAX", "SJC", "SEA", "ORD", "DFW", "IAD", "JFK"].includes(colo)) {
+    // 返回10个常见的香港/台湾优选IP（带colo信息）
+    return [
+      { ip: "188.114.96.3", colo: "HKG" },
+      { ip: "188.114.97.3", colo: "HKG" },
+      { ip: "104.16.1.3", colo: "TPE" },
+      { ip: "104.16.2.3", colo: "TPE" },
+      { ip: "104.17.1.3", colo: "HKG" },
+      { ip: "104.18.1.3", colo: "SIN" },
+      { ip: "172.64.32.1", colo: "HKG" },
+      { ip: "172.64.33.1", colo: "TPE" },
+      { ip: "141.101.64.1", colo: "HKG" },
+      { ip: "104.24.0.1", colo: "TPE" }
+    ];
+  }
+  
   // A 类：亚洲常见优选（HKG / TPE / SIN / ICN）
   if (colo === "HKG" || colo === "TPE" || colo === "SIN" || colo === "ICN") {
     return [
-      "188.114.97.3",
-      "188.114.96.3",
-      "104.16.1.3"
+      { ip: "188.114.97.3", colo: "HKG" },
+      { ip: "188.114.96.3", colo: "HKG" },
+      { ip: "104.16.1.3", colo: "TPE" },
+      { ip: "104.16.2.3", colo: "TPE" },
+      { ip: "104.17.1.3", colo: "HKG" },
+      { ip: "172.64.32.1", colo: "HKG" },
+      { ip: "172.64.33.1", colo: "TPE" },
+      { ip: "141.101.64.1", colo: "HKG" },
+      { ip: "104.18.1.3", colo: "SIN" },
+      { ip: "104.24.0.1", colo: "TPE" }
     ];
   }
   // 日本 / 关西等
   if (colo === "NRT" || colo === "KIX") {
     return [
-      "104.16.1.3",
-      "104.17.1.3",
-      "188.114.96.3"
+      { ip: "104.16.1.3", colo: "NRT" },
+      { ip: "104.17.1.3", colo: "NRT" },
+      { ip: "188.114.96.3", colo: "KIX" },
+      { ip: "188.114.97.3", colo: "NRT" },
+      { ip: "104.18.1.3", colo: "NRT" },
+      { ip: "172.64.32.1", colo: "NRT" },
+      { ip: "172.64.33.1", colo: "KIX" },
+      { ip: "141.101.64.1", colo: "NRT" },
+      { ip: "104.16.2.3", colo: "KIX" },
+      { ip: "104.24.0.1", colo: "NRT" }
     ];
   }
-  // 北美常见入口
-  if (colo === "LAX" || colo === "SJC" || colo === "SEA" || colo === "ORD" || colo === "DFW" || colo === "IAD" || colo === "JFK") {
-    return [
-      "188.114.96.3",
-      "188.114.97.3",
-      "141.101.64.3"
-    ];
-  }
-  // 其他未知地区，返回一个相对通用的组合
+  // 其他未知地区，返回一个相对通用的组合（优先亚洲节点）
   return [
-    "188.114.96.3",
-    "188.114.97.3",
-    "104.16.1.3"
+    { ip: "188.114.96.3", colo: "HKG" },
+    { ip: "188.114.97.3", colo: "HKG" },
+    { ip: "104.16.1.3", colo: "TPE" },
+    { ip: "104.16.2.3", colo: "TPE" },
+    { ip: "104.17.1.3", colo: "HKG" },
+    { ip: "104.18.1.3", colo: "SIN" },
+    { ip: "172.64.32.1", colo: "HKG" },
+    { ip: "172.64.33.1", colo: "TPE" },
+    { ip: "141.101.64.1", colo: "HKG" },
+    { ip: "104.24.0.1", colo: "TPE" }
   ];
 }
 
 // 单 IP 版本：保留给可能需要的地方使用（取列表第一个）
-function pickIpByColo(colo) {
-  const list = pickIpListByColo(colo);
+async function pickIpByColo(colo, cfg = null) {
+  const list = await pickIpListByColo(colo, cfg);
   return list && list.length ? list[0] : "188.114.96.3";
 }
 
-function renderHealthPage(health) {
+function renderHealthPage(health, request = null) {
   const statusColor = health.status === "ok" ? "green" : health.status === "warning" ? "yellow" : "red";
   const statusIcon = health.status === "ok" ? "✅" : health.status === "warning" ? "⚠️" : "❌";
   const statusBg = health.status === "ok" ? "bg-green-50 border-green-200" : health.status === "warning" ? "bg-yellow-50 border-yellow-200" : "bg-red-50 border-red-200";
+  
+  // 获取当前域名
+  let currentHostname = "your-domain.com";
+  try {
+    if (request) {
+      const url = new URL(request.url);
+      currentHostname = url.hostname;
+    } else if (health.config && health.config.workerHost) {
+      currentHostname = health.config.workerHost;
+    }
+  } catch (e) {
+    // 如果获取失败，使用默认值
+  }
   
   return `<!DOCTYPE html>
 <html lang="zh">
@@ -1508,6 +2418,39 @@ function renderHealthPage(health) {
         </a>
       </div>
     </div>
+
+    <!-- IP 切换指南 -->
+    ${health.network.colo && ["LAX", "SJC", "SEA", "ORD", "DFW", "IAD", "JFK"].includes(health.network.colo.toUpperCase()) ? `
+    <div class="info-card" style="background: #fef3c7; border: 2px solid #f59e0b;">
+      <h2 class="text-xl font-semibold mb-4" style="color: #92400e;">⚠️ 当前入口节点：${health.network.colo}（${health.network.country}）</h2>
+      <p class="mb-4" style="color: #78350f;">当前节点延迟较高，建议切换到亚洲节点（HKG/TPE/NRT/SIN）以获得更好的访问速度。</p>
+      <div class="bg-white rounded-lg p-4 mb-4">
+        <h3 class="font-semibold mb-3" style="color: #78350f;">📋 切换步骤：</h3>
+        <ol class="list-decimal list-inside space-y-2 text-sm" style="color: #92400e;">
+          <li><strong>获取推荐 IP 段：</strong> ${health.network.colo === "LAX" ? "188.114.96.0/20, 141.101.64.0/18, 104.24.0.0/14" : "188.114.96.0/20, 104.16.0.0/13, 172.64.0.0/13"}</li>
+          <li><strong>使用工具测试 IP：</strong>
+            <ul class="list-disc list-inside ml-4 mt-1">
+              <li>Windows: 使用 <code class="bg-gray-100 px-1 rounded">CF优选IP工具</code> 或 <code class="bg-gray-100 px-1 rounded">Better Cloudflare IP</code></li>
+              <li>在线工具: <a href="https://stock.hostmonit.com/CloudFlareYes" target="_blank" class="text-blue-600 underline">stock.hostmonit.com/CloudFlareYes</a></li>
+              <li>测试命令: <code class="bg-gray-100 px-1 rounded">ping -n 10 [IP地址]</code></li>
+            </ul>
+          </li>
+          <li><strong>绑定新 IP 到域名：</strong>
+            <ul class="list-disc list-inside ml-4 mt-1">
+              <li>在域名 DNS 中添加 A 记录，指向选中的 IP</li>
+              <li>或使用 CNAME 指向 Cloudflare 的 CDN 域名</li>
+              <li>等待 DNS 生效（通常几分钟到几小时）</li>
+            </ul>
+          </li>
+          <li><strong>验证新节点：</strong> 访问 <a href="/api/geo" class="text-blue-600 underline">/api/geo</a> 查看新的 colo 是否为 HKG/TPE/NRT/SIN</li>
+        </ol>
+      </div>
+      <div class="bg-blue-50 rounded-lg p-3">
+        <p class="text-sm font-semibold mb-2" style="color: #1e40af;">💡 快速测试方法：</p>
+        <p class="text-xs" style="color: #1e3a8a;">在本地 hosts 文件中临时绑定：<code class="bg-white px-1 rounded">[测试IP] ${currentHostname}</code>，然后访问 <a href="/api/geo" class="text-blue-600 underline">/api/geo</a> 查看 colo 变化。</p>
+      </div>
+    </div>
+    ` : ''}
 
     <!-- 操作按钮 -->
     <div class="info-card">
